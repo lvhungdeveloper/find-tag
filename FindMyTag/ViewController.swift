@@ -1,6 +1,7 @@
 import UIKit
 import NearbyInteraction
 import CoreBluetooth
+import simd
 import os
 
 // MARK: - BLE UUIDs
@@ -34,13 +35,20 @@ class ViewController: UIViewController {
     var accessoryMap = [NIDiscoveryToken: String]()
     var lastUpdateTime: Date?
     var isSessionRunning = false
+    var currentAccessoryName: String?
+    
     // MARK: - UI Elements
     let connectionLabel = UILabel()
     let uwbStateLabel = UILabel()
     let infoLabel = UILabel()
     let distanceLabel = UILabel()
     let logoLabel = UILabel()
+    let findButton = UIButton(type: .system)
     let runSessionButton = UIButton(type: .system)
+    
+    // Direction finding view (fullscreen, like Find My)
+    let directionView = DirectionView()
+    let directionBackButton = UIButton(type: .system)
 
     let logger = Logger(subsystem: "com.findmy.aletag", category: "ViewController")
 
@@ -76,6 +84,16 @@ class ViewController: UIViewController {
         distanceLabel.textColor = .systemBlue
         distanceLabel.numberOfLines = 0
         distanceLabel.textAlignment = .center
+        
+        // Find button (like Find My app)
+        findButton.setTitle("🧭 Find", for: .normal)
+        findButton.setTitleColor(.white, for: .normal)
+        findButton.backgroundColor = .systemGreen
+        findButton.layer.cornerRadius = 8
+        findButton.contentEdgeInsets = UIEdgeInsets(top: 12, left: 32, bottom: 12, right: 32)
+        findButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+        findButton.isHidden = true // Hide until session starts
+        findButton.addTarget(self, action: #selector(showDirectionView), for: .touchUpInside)
 
         runSessionButton.setTitle("Start Session", for: .normal)
         runSessionButton.setTitleColor(.white, for: .normal)
@@ -86,7 +104,7 @@ class ViewController: UIViewController {
         runSessionButton.alpha = 0.5
         runSessionButton.addTarget(self, action: #selector(buttonTapped), for: .touchUpInside)
 
-        let stack = UIStackView(arrangedSubviews: [logoLabel, connectionLabel, uwbStateLabel, infoLabel, distanceLabel, runSessionButton])
+        let stack = UIStackView(arrangedSubviews: [logoLabel, connectionLabel, uwbStateLabel, infoLabel, distanceLabel, findButton, runSessionButton])
         stack.axis = .vertical
         stack.spacing = 16
         stack.alignment = .center
@@ -99,6 +117,59 @@ class ViewController: UIViewController {
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -20)
         ])
+        
+        // Setup direction finding view (fullscreen overlay)
+        setupDirectionView()
+    }
+    
+    func setupDirectionView() {
+        // Direction view setup (hidden by default)
+        directionView.translatesAutoresizingMaskIntoConstraints = false
+        directionView.backgroundColor = .black
+        directionView.isHidden = true
+        directionView.alpha = 0
+        view.addSubview(directionView)
+        
+        // Back button
+        directionBackButton.setTitle("◀ Back", for: .normal)
+        directionBackButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+        directionBackButton.setTitleColor(.white, for: .normal)
+        directionBackButton.translatesAutoresizingMaskIntoConstraints = false
+        directionBackButton.addTarget(self, action: #selector(hideDirectionView), for: .touchUpInside)
+        directionView.addSubview(directionBackButton)
+        
+        NSLayoutConstraint.activate([
+            directionView.topAnchor.constraint(equalTo: view.topAnchor),
+            directionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            directionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            directionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            
+            directionBackButton.topAnchor.constraint(equalTo: directionView.safeAreaLayoutGuide.topAnchor, constant: 20),
+            directionBackButton.leadingAnchor.constraint(equalTo: directionView.leadingAnchor, constant: 20)
+        ])
+    }
+    
+    @objc func showDirectionView() {
+        // Set tag name
+        if let name = currentAccessoryName {
+            directionView.setTagName(name)
+        }
+        
+        // Reset tracking for fresh start
+        directionView.resetTracking()
+        
+        directionView.isHidden = false
+        UIView.animate(withDuration: 0.3) {
+            self.directionView.alpha = 1
+        }
+    }
+    
+    @objc func hideDirectionView() {
+        UIView.animate(withDuration: 0.3) {
+            self.directionView.alpha = 0
+        } completion: { _ in
+            self.directionView.isHidden = true
+        }
     }
 
     @objc func handleConnectionTap() {
@@ -112,6 +183,8 @@ class ViewController: UIViewController {
                 self.runSessionButton.isEnabled = false
                 self.runSessionButton.alpha = 0.5
                 self.distanceLabel.text = ""
+                self.findButton.isHidden = true
+                self.hideDirectionView()
             }))
             present(alert, animated: true)
         } else {
@@ -144,6 +217,8 @@ class ViewController: UIViewController {
 
         uwbStateLabel.text = "Accessory UWB state: OFF"
         distanceLabel.text = ""
+        findButton.isHidden = true
+        hideDirectionView()
         } else {
             // Gửi initialize (0xA)
             let initMsg = Data([MessageId.initialize.rawValue])
@@ -185,8 +260,12 @@ class ViewController: UIViewController {
                 niSession.run(configuration!)
                 
                 isSessionRunning = true
+                currentAccessoryName = accessoryName
                 runSessionButton.setTitle("End Session", for: .normal)
-                updateInfo("\(accessoryName) connected.\nAccessory session started.")
+                updateInfo("\(accessoryName) connected.\nUWB session running")
+                
+                // Show Find button
+                findButton.isHidden = false
             } catch {
                 updateInfo("Invalid config data: \(error)")
             }
@@ -250,6 +329,8 @@ extension ViewController: CBCentralManagerDelegate {
         runSessionButton.alpha = 0.5
         uwbStateLabel.text = "Accessory UWB state: OFF"
         distanceLabel.text = ""
+        findButton.isHidden = true
+        hideDirectionView()
     }
 }
 
@@ -296,20 +377,49 @@ extension ViewController: NISessionDelegate {
     }
 
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
-        guard let obj = nearbyObjects.first, let distance = obj.distance else { return }
+        guard let obj = nearbyObjects.first else { return }
 
         if let name = accessoryMap[obj.discoveryToken] {
             let now = Date()
             var intervalText = ""
+            var intervalEmoji = ""
 
             if let last = lastUpdateTime {
                 let interval = now.timeIntervalSince(last)
-                intervalText = String(format: "Interval: %.3f sec", interval)
+                
+                // Classify update rate quality
+                if interval < 0.1 {
+                    intervalEmoji = "🟢" // Excellent: < 100ms
+                } else if interval < 0.2 {
+                    intervalEmoji = "🟡" // Good: 100-200ms
+                } else {
+                    intervalEmoji = "🔴" // Slow: > 200ms
+                }
+                
+                intervalText = String(format: "%@ %.0f ms", intervalEmoji, interval * 1000)
             }
 
             lastUpdateTime = now
 
-            distanceLabel.text = String(format: "%@ is %.2f m\n%@", name, distance, intervalText)
+            // Update distance label on main screen
+            if let distance = obj.distance {
+                distanceLabel.text = String(format: "%@ is %.2f m\n%@", name, distance, intervalText)
+            } else {
+                distanceLabel.text = String(format: "%@\n%@", name, intervalText)
+            }
+            
+            // Update direction view if it's visible
+            if !directionView.isHidden {
+                if let direction = obj.direction {
+                    directionView.updateDirection(direction: direction, distance: obj.distance)
+                    directionView.showHasDirection()
+                } else {
+                    // Direction is nil - update distance but keep arrow dim
+                    directionView.updateDistanceOnly(distance: obj.distance)
+                    directionView.showNoDirection()
+                    logger.warning("⚠️ Direction data is nil - UWB can't determine angle")
+                }
+            }
         }
     }
 
