@@ -4,8 +4,6 @@
 <dict>
 	<key>NSUserTrackingUsageDescription</key>
 	<string>App needs access to nearby interaction for tag detection.</string>
-	<key>NSMotionUsageDescription</key>
-	<string>This app uses device motion to provide accurate directional guidance to your tag.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -21,6 +21,10 @@ enum MessageId: UInt8 {
 }
 
 class ViewController: UIViewController {
+    // MARK: - Configuration
+    // TODO: Replace with device ID from your server
+    let TARGET_DEVICE_NAME = "4423"  // 🔧 HARDCODED - Change this to your device name
+    
     // MARK: - BLE + UWB
     var centralManager: CBCentralManager!
     var peripheral: CBPeripheral?
@@ -68,7 +72,7 @@ class ViewController: UIViewController {
         logoLabel.textColor = .systemBlue
         logoLabel.textAlignment = .center
 
-        connectionLabel.text = "Connection state: Not Connected"
+        connectionLabel.text = "Connection State: Not Connected"
         connectionLabel.textColor = .systemBlue
         connectionLabel.isUserInteractionEnabled = true
         let tapConnect = UITapGestureRecognizer(target: self, action: #selector(handleConnectionTap))
@@ -123,17 +127,18 @@ class ViewController: UIViewController {
     }
     
     func setupDirectionView() {
-        // Direction view setup (hidden by default)
+        // Direction view setup (hidden by default) - Green background like Find My
         directionView.translatesAutoresizingMaskIntoConstraints = false
-        directionView.backgroundColor = .black
         directionView.isHidden = true
         directionView.alpha = 0
         view.addSubview(directionView)
         
-        // Back button
-        directionBackButton.setTitle("◀ Back", for: .normal)
-        directionBackButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+        // Close button (X like Find My)
+        directionBackButton.setTitle("✕", for: .normal)
+        directionBackButton.titleLabel?.font = UIFont.systemFont(ofSize: 28, weight: .regular)
         directionBackButton.setTitleColor(.white, for: .normal)
+        directionBackButton.backgroundColor = UIColor.white.withAlphaComponent(0.2)
+        directionBackButton.layer.cornerRadius = 25
         directionBackButton.translatesAutoresizingMaskIntoConstraints = false
         directionBackButton.addTarget(self, action: #selector(hideDirectionView), for: .touchUpInside)
         directionView.addSubview(directionBackButton)
@@ -144,8 +149,11 @@ class ViewController: UIViewController {
             directionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             directionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             
-            directionBackButton.topAnchor.constraint(equalTo: directionView.safeAreaLayoutGuide.topAnchor, constant: 20),
-            directionBackButton.leadingAnchor.constraint(equalTo: directionView.leadingAnchor, constant: 20)
+            // Close button at bottom center (like Find My) - moved higher to not overlap hint text
+            directionBackButton.centerXAnchor.constraint(equalTo: directionView.centerXAnchor),
+            directionBackButton.bottomAnchor.constraint(equalTo: directionView.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            directionBackButton.widthAnchor.constraint(equalToConstant: 50),
+            directionBackButton.heightAnchor.constraint(equalToConstant: 50)
         ])
     }
     
@@ -179,7 +187,7 @@ class ViewController: UIViewController {
             alert.addAction(UIAlertAction(title: "Disconnect", style: .destructive, handler: { _ in
                 self.centralManager.cancelPeripheralConnection(self.peripheral!)
                 self.peripheral = nil
-                self.connectionLabel.text = "Connection state: Not Connected"
+                self.connectionLabel.text = "Connection State: Not Connected"
                 self.runSessionButton.isEnabled = false
                 self.runSessionButton.alpha = 0.5
                 self.distanceLabel.text = ""
@@ -304,6 +312,14 @@ extension ViewController: CBCentralManagerDelegate {
         if !discoveredPeripherals.contains(where: { $0.0.identifier == peripheral.identifier }) {
             discoveredPeripherals.append((peripheral, name))
         }
+        
+        // 🔥 AUTO-CONNECT: Connect to target device automatically
+        if name == TARGET_DEVICE_NAME && self.peripheral == nil {
+            logger.info("🎯 Found target device: \(name) - Auto-connecting...")
+            updateInfo("Found \(name) - Connecting...")
+            central.stopScan()  // ✅ Correct method name
+            central.connect(peripheral, options: nil)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -311,7 +327,11 @@ extension ViewController: CBCentralManagerDelegate {
         self.discoveredPeripheralName = peripheral.name ?? "Accessory"
         peripheral.delegate = self
         peripheral.discoverServices([TransferService.serviceUUID])
-        connectionLabel.text = "Connection state: Connected"
+        
+        let tagName = peripheral.name ?? "Tag"
+        connectionLabel.text = "Connection State: Connected"
+        updateInfo("The tag \(tagName) is connected")
+        
         runSessionButton.isEnabled = true
         runSessionButton.alpha = 1.0
     }
@@ -323,7 +343,7 @@ extension ViewController: CBCentralManagerDelegate {
         self.txCharacteristic = nil
         self.isSessionRunning = false
 
-        connectionLabel.text = "Connection state: Not Connected"
+        connectionLabel.text = "Connection State: Not Connected"
         runSessionButton.setTitle("Start Session", for: .normal)
         runSessionButton.isEnabled = false
         runSessionButton.alpha = 0.5
@@ -401,23 +421,46 @@ extension ViewController: NISessionDelegate {
 
             lastUpdateTime = now
 
-            // Update distance label on main screen
+            // Update distance label on main screen (show 0.0m if negative)
             if let distance = obj.distance {
-                distanceLabel.text = String(format: "%@ is %.2f m\n%@", name, distance, intervalText)
+                let displayDistance = max(distance, 0.0)  // Clamp to 0 minimum
+                distanceLabel.text = String(format: "%@ is %.2f m\n%@", name, displayDistance, intervalText)
             } else {
                 distanceLabel.text = String(format: "%@\n%@", name, intervalText)
+            }
+            
+            // 🔍 DEBUG LOG: Log distance and direction data
+            logger.info("📊 UWB Data:")
+            if let distance = obj.distance {
+                let displayDistance = max(distance, 0.0)  // Clamp to 0 minimum
+                logger.info("  Distance: \(String(format: "%.2f", displayDistance)) m ✅")
+            } else {
+                logger.info("  Distance: nil ❌")
+            }
+            
+            if let direction = obj.direction {
+                logger.info("  Direction: x=\(String(format: "%.3f", direction.x)), y=\(String(format: "%.3f", direction.y)), z=\(String(format: "%.3f", direction.z)) ✅")
+                
+                // Calculate angle and magnitude for debugging
+                let angle = atan2(direction.x, -direction.z)
+                let degrees = angle * 180.0 / Float.pi
+                let horizontalMagnitude = sqrt(direction.x * direction.x + direction.z * direction.z)
+                
+                logger.info("  Calculated Angle: \(String(format: "%.1f", degrees))° | H-Mag: \(String(format: "%.3f", horizontalMagnitude))")
+            } else {
+                logger.info("  Direction: nil ❌")
             }
             
             // Update direction view if it's visible
             if !directionView.isHidden {
                 if let direction = obj.direction {
-                    directionView.updateDirection(direction: direction, distance: obj.distance)
+                    // UWB direction is RELATIVE to device - no heading adjustment needed
+                    directionView.updateDirection(direction: direction, distance: obj.distance, deviceHeading: nil)
                     directionView.showHasDirection()
                 } else {
                     // Direction is nil - update distance but keep arrow dim
                     directionView.updateDistanceOnly(distance: obj.distance)
                     directionView.showNoDirection()
-                    logger.warning("⚠️ Direction data is nil - UWB can't determine angle")
                 }
             }
         }
