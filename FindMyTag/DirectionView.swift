@@ -18,16 +18,16 @@ class DirectionView: UIView {
     
     // Moving average filter - lưu nhiều raw samples để tính trung bình
     private var rawAngleHistory: [Float] = []
-    private let historySize = 20  // Tăng từ 15 lên 20 để smooth hơn nữa
+    private let historySize = 8  // Giảm từ 20 → 8 để responsive hơn
     
-    // Weighted moving average weights - samples gần đây có trọng số cao hơn
-    private let weights: [Float] = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.12]  // Tổng = 1.0
+    // Weighted moving average weights - samples gần đây có trọng số NHIỀU hơn
+    private let weights: [Float] = [0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.22]  // Tổng = 1.0, bias mạnh về samples mới
     
     // CADisplayLink for smooth 60fps animation
     private var displayLink: CADisplayLink?
     
     // Exponential smoothing factor (double smoothing sau WMA)
-    private let exponentialSmoothingFactor: Float = 0.15  // Thấp = smooth hơn
+    private let exponentialSmoothingFactor: Float = 0.30  // Tăng từ 0.15 → 0.30 để responsive hơn
     
     // MARK: - Init
     override init(frame: CGRect) {
@@ -157,8 +157,8 @@ class DirectionView: UIView {
         // Smooth interpolation từ currentAngle đến targetAngle
         let angleDiff = shortestAngularDifference(from: currentAngle, to: targetAngle)
         
-        // Exponential smoothing với damping
-        let dampingFactor: Float = 0.08  // Thấp hơn = smooth hơn nhưng chậm hơn
+        // Exponential smoothing với damping - TĂNG để responsive hơn
+        let dampingFactor: Float = 0.18  // Tăng từ 0.08 → 0.18 để nhanh hơn
         currentAngle = currentAngle + angleDiff * dampingFactor
         
         // Normalize angle
@@ -202,14 +202,18 @@ class DirectionView: UIView {
         let horizontalDirection = simd_float3(direction.x, 0, direction.z)
         let magnitude = simd_length(horizontalDirection)
         
-        // Giảm threshold để chấp nhận nhiều raw data hơn (từ 0.1 → 0.05)
-        guard magnitude > 0.05 else {
+        // Tăng threshold để chỉ chấp nhận signals mạnh (0.05 → 0.12)
+        // Signal yếu thường không chính xác, gây lệch góc
+        guard magnitude > 0.12 else {
             // Direction vector too weak - keep current angle
             return
         }
         
         // Normalize for consistent angle calculation
         let normalized = simd_normalize(horizontalDirection)
+        
+        // Đánh giá quality của signal dựa trên magnitude
+        let isHighQualitySignal = magnitude > 0.7  // Signal rất mạnh = rất tin cậy
         
         // ============================================================
         // STEP 2: CALCULATE RAW ANGLE (không lọc)
@@ -238,8 +242,11 @@ class DirectionView: UIView {
             targetAngle = rawAngle
             currentAngle = rawAngle
             isFirstUpdate = false
-        } else if rawAngleHistory.count < 3 {
-            // Chưa đủ samples, dùng simple average
+        } else if rawAngleHistory.count < 2 {
+            // Chưa đủ samples, dùng raw angle (giảm từ 3 → 2 để responsive hơn)
+            wmaAngle = rawAngle
+        } else if isHighQualitySignal && rawAngleHistory.count < 4 {
+            // Signal tốt + ít samples → dùng simple average nhanh
             wmaAngle = simpleMovingAverage(rawAngleHistory)
         } else {
             // Đủ samples, dùng weighted moving average
@@ -248,14 +255,19 @@ class DirectionView: UIView {
         }
         
         // ============================================================
-        // STEP 5: DOUBLE SMOOTHING - Exponential smoothing sau WMA
+        // STEP 5: ADAPTIVE SMOOTHING - Smoothing ít hơn khi signal tốt
         // ============================================================
         if !isFirstUpdate {
             // Tính angular difference
             let diff = shortestAngularDifference(from: targetAngle, to: wmaAngle)
             
+            // Adaptive smoothing factor dựa trên signal quality
+            // Signal tốt → responsive hơn (factor cao)
+            // Signal yếu → smooth hơn (factor thấp)
+            let adaptiveFactor: Float = isHighQualitySignal ? 0.50 : exponentialSmoothingFactor
+            
             // Apply exponential moving average (layer thứ 2)
-            targetAngle = normalizeAngle(targetAngle + diff * exponentialSmoothingFactor)
+            targetAngle = normalizeAngle(targetAngle + diff * adaptiveFactor)
         }
         
         // ============================================================
