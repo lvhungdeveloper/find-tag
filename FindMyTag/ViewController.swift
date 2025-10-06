@@ -23,7 +23,7 @@ enum MessageId: UInt8 {
 class ViewController: UIViewController {
     // MARK: - Configuration
     // TODO: Replace with device ID from your server
-    let TARGET_DEVICE_NAME = "4423"  // 🔧 HARDCODED - Change this to your device name
+    let TARGET_DEVICE_NAME = "4411"  // 🔧 HARDCODED - Change this to your device name
     
     // MARK: - BLE + UWB
     var centralManager: CBCentralManager!

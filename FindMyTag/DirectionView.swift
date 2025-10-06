@@ -12,16 +12,22 @@ class DirectionView: UIView {
     private let hintLabel = UILabel()
     
     // Smoothing parameters
-    private var currentAngle: Float = 0
-    private var smoothedAngle: Float = 0
+    private var currentAngle: Float = 0  // Góc hiện tại đang hiển thị (interpolated)
+    private var targetAngle: Float = 0   // Góc mục tiêu (sau khi lọc)
     private var isFirstUpdate = true
     
-    // Median filter (for outlier rejection)
-    private var angleHistory: [Float] = []
-    private let historySize = 5
+    // Moving average filter - lưu nhiều raw samples để tính trung bình
+    private var rawAngleHistory: [Float] = []
+    private let historySize = 20  // Tăng từ 15 lên 20 để smooth hơn nữa
     
-    // Low-pass filter (simple and effective)
-    private let smoothingFactor: Float = 0.25  // Lower = smoother, Higher = more responsive
+    // Weighted moving average weights - samples gần đây có trọng số cao hơn
+    private let weights: [Float] = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.12]  // Tổng = 1.0
+    
+    // CADisplayLink for smooth 60fps animation
+    private var displayLink: CADisplayLink?
+    
+    // Exponential smoothing factor (double smoothing sau WMA)
+    private let exponentialSmoothingFactor: Float = 0.15  // Thấp = smooth hơn
     
     // MARK: - Init
     override init(frame: CGRect) {
@@ -130,6 +136,51 @@ class DirectionView: UIView {
             hintLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
             hintLabel.topAnchor.constraint(equalTo: distanceLabel.bottomAnchor, constant: 8)
         ])
+        
+        // Start smooth animation loop
+        startDisplayLink()
+    }
+    
+    // MARK: - Display Link Animation (60fps)
+    private func startDisplayLink() {
+        guard displayLink == nil else { return }
+        displayLink = CADisplayLink(target: self, selector: #selector(updateDisplayLink))
+        displayLink?.add(to: .main, forMode: .common)
+    }
+    
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+    
+    @objc private func updateDisplayLink() {
+        // Smooth interpolation từ currentAngle đến targetAngle
+        let angleDiff = shortestAngularDifference(from: currentAngle, to: targetAngle)
+        
+        // Exponential smoothing với damping
+        let dampingFactor: Float = 0.08  // Thấp hơn = smooth hơn nhưng chậm hơn
+        currentAngle = currentAngle + angleDiff * dampingFactor
+        
+        // Normalize angle
+        currentAngle = normalizeAngle(currentAngle)
+        
+        // Apply rotation trực tiếp (không qua UIView.animate)
+        arrowImageView.transform = CGAffineTransform(rotationAngle: CGFloat(currentAngle))
+    }
+    
+    private func shortestAngularDifference(from: Float, to: Float) -> Float {
+        var diff = to - from
+        // Normalize to [-π, π] (shortest path)
+        while diff > Float.pi { diff -= 2 * Float.pi }
+        while diff < -Float.pi { diff += 2 * Float.pi }
+        return diff
+    }
+    
+    private func normalizeAngle(_ angle: Float) -> Float {
+        var normalized = angle
+        while normalized > Float.pi { normalized -= 2 * Float.pi }
+        while normalized < -Float.pi { normalized += 2 * Float.pi }
+        return normalized
     }
     
     override func layoutSubviews() {
@@ -145,14 +196,14 @@ class DirectionView: UIView {
     // MARK: - Public Methods
     func updateDirection(direction: simd_float3, distance: Float?, deviceHeading: Float? = nil) {
         // ============================================================
-        // STEP 1: VALIDATE & NORMALIZE DIRECTION VECTOR
+        // STEP 1: VALIDATE & NORMALIZE DIRECTION VECTOR (RAW DATA)
         // ============================================================
         // Only use horizontal component (project to XZ plane)
         let horizontalDirection = simd_float3(direction.x, 0, direction.z)
         let magnitude = simd_length(horizontalDirection)
         
-        // Reject invalid readings (too small magnitude = unreliable)
-        guard magnitude > 0.1 else {
+        // Giảm threshold để chấp nhận nhiều raw data hơn (từ 0.1 → 0.05)
+        guard magnitude > 0.05 else {
             // Direction vector too weak - keep current angle
             return
         }
@@ -161,7 +212,7 @@ class DirectionView: UIView {
         let normalized = simd_normalize(horizontalDirection)
         
         // ============================================================
-        // STEP 2: CALCULATE ANGLE
+        // STEP 2: CALCULATE RAW ANGLE (không lọc)
         // ============================================================
         // UWB coordinate: x=right, y=up, z=backward
         // atan2(x, -z) gives angle relative to forward direction
@@ -169,68 +220,59 @@ class DirectionView: UIView {
         let rawAngle = atan2(normalized.x, -normalized.z)
         
         // ============================================================
-        // STEP 3: MEDIAN FILTER (reject outliers)
+        // STEP 3: LƯU RAW ANGLE VÀO HISTORY
         // ============================================================
-        angleHistory.append(rawAngle)
-        if angleHistory.count > historySize {
-            angleHistory.removeFirst()
-        }
-        
-        // Use median to reject outliers
-        let medianAngle: Float
-        if angleHistory.count >= 3 {
-            let sorted = angleHistory.sorted()
-            medianAngle = sorted[sorted.count / 2]
-        } else {
-            medianAngle = rawAngle
+        rawAngleHistory.append(rawAngle)
+        if rawAngleHistory.count > historySize {
+            rawAngleHistory.removeFirst()
         }
         
         // ============================================================
-        // STEP 4: LOW-PASS FILTER (smooth but responsive)
+        // STEP 4: ÁP DỤNG WEIGHTED MOVING AVERAGE (trung bình trượt có trọng số)
         // ============================================================
-        let finalAngle: Float
+        let wmaAngle: Float
         
         if isFirstUpdate {
-            // First reading: initialize
-            smoothedAngle = medianAngle
-            finalAngle = medianAngle
+            // First reading: khởi tạo
+            wmaAngle = rawAngle
+            targetAngle = rawAngle
+            currentAngle = rawAngle
             isFirstUpdate = false
+        } else if rawAngleHistory.count < 3 {
+            // Chưa đủ samples, dùng simple average
+            wmaAngle = simpleMovingAverage(rawAngleHistory)
         } else {
-            // Calculate shortest angular difference (handle wrap-around)
-            var diff = medianAngle - smoothedAngle
-            
-            // Normalize to [-π, π] (shortest path)
-            while diff > Float.pi { diff -= 2 * Float.pi }
-            while diff < -Float.pi { diff += 2 * Float.pi }
-            
-            // Apply low-pass filter (exponential moving average)
-            smoothedAngle = smoothedAngle + diff * smoothingFactor
-            
-            // Normalize result
-            while smoothedAngle > Float.pi { smoothedAngle -= 2 * Float.pi }
-            while smoothedAngle < -Float.pi { smoothedAngle += 2 * Float.pi }
-            
-            finalAngle = smoothedAngle
+            // Đủ samples, dùng weighted moving average
+            // Samples gần đây có trọng số cao hơn
+            wmaAngle = weightedMovingAverage(rawAngleHistory)
         }
         
-        // Calculate degrees for direction text
-        let degrees = finalAngle * 180.0 / Float.pi
+        // ============================================================
+        // STEP 5: DOUBLE SMOOTHING - Exponential smoothing sau WMA
+        // ============================================================
+        if !isFirstUpdate {
+            // Tính angular difference
+            let diff = shortestAngularDifference(from: targetAngle, to: wmaAngle)
+            
+            // Apply exponential moving average (layer thứ 2)
+            targetAngle = normalizeAngle(targetAngle + diff * exponentialSmoothingFactor)
+        }
+        
+        // ============================================================
+        // STEP 6: UPDATE UI (CADisplayLink sẽ smooth interpolate đến targetAngle)
+        // ============================================================
+        let degrees = targetAngle * 180.0 / Float.pi
         
         // Check if arrow is pointing at dot (aligned with target)
-        let isAligned = abs(finalAngle) < 0.17  // ~10 degrees tolerance
+        let isAligned = abs(targetAngle) < 0.17  // ~10 degrees tolerance
         
-        if isAligned && abs(finalAngle - currentAngle) > 0.15 {
+        if isAligned && abs(targetAngle - currentAngle) > 0.15 {
             // Just aligned → haptic feedback
             let generator = UIImpactFeedbackGenerator(style: .medium)
             generator.impactOccurred()
         }
         
-        currentAngle = finalAngle
-        
-        // Apply rotation with animation
-        UIView.animate(withDuration: 0.15, delay: 0, options: [.curveLinear, .allowUserInteraction, .beginFromCurrentState]) {
-            self.arrowImageView.transform = CGAffineTransform(rotationAngle: CGFloat(finalAngle))
-        }
+        // KHÔNG dùng UIView.animate - CADisplayLink sẽ handle rotation
         
         // Fade dot when aligned (arrow pointing at it)
         UIView.animate(withDuration: 0.2) {
@@ -248,6 +290,70 @@ class DirectionView: UIView {
         // Update direction text based on angle
         let directionText = getDirectionText(degrees: degrees)
         hintLabel.text = directionText
+    }
+    
+    // ============================================================
+    // HELPER: Simple Moving Average (SMA)
+    // ============================================================
+    private func simpleMovingAverage(_ angles: [Float]) -> Float {
+        guard !angles.isEmpty else { return 0 }
+        
+        // Xử lý angle wrap-around (ví dụ: 179° và -179° cần average thành ±180°, không phải 0°)
+        let reference = angles[0]
+        var sum: Float = 0
+        
+        for angle in angles {
+            var diff = angle - reference
+            // Normalize difference to [-π, π]
+            while diff > Float.pi { diff -= 2 * Float.pi }
+            while diff < -Float.pi { diff += 2 * Float.pi }
+            sum += diff
+        }
+        
+        let averageDiff = sum / Float(angles.count)
+        var result = reference + averageDiff
+        
+        // Normalize result to [-π, π]
+        while result > Float.pi { result -= 2 * Float.pi }
+        while result < -Float.pi { result += 2 * Float.pi }
+        
+        return result
+    }
+    
+    // ============================================================
+    // HELPER: Weighted Moving Average (WMA)
+    // ============================================================
+    private func weightedMovingAverage(_ angles: [Float]) -> Float {
+        guard !angles.isEmpty else { return 0 }
+        
+        // Lấy N samples gần nhất (N = số lượng weights)
+        let n = min(weights.count, angles.count)
+        let recentAngles = Array(angles.suffix(n))
+        let recentWeights = Array(weights.suffix(n))
+        
+        // Normalize weights nếu không dùng hết
+        let weightSum = recentWeights.reduce(0, +)
+        let normalizedWeights = recentWeights.map { $0 / weightSum }
+        
+        // Xử lý angle wrap-around
+        let reference = recentAngles[0]
+        var weightedSum: Float = 0
+        
+        for (angle, weight) in zip(recentAngles, normalizedWeights) {
+            var diff = angle - reference
+            // Normalize difference to [-π, π]
+            while diff > Float.pi { diff -= 2 * Float.pi }
+            while diff < -Float.pi { diff += 2 * Float.pi }
+            weightedSum += diff * weight
+        }
+        
+        var result = reference + weightedSum
+        
+        // Normalize result to [-π, π]
+        while result > Float.pi { result -= 2 * Float.pi }
+        while result < -Float.pi { result += 2 * Float.pi }
+        
+        return result
     }
     
     func updateDistanceOnly(distance: Float?) {
@@ -312,9 +418,15 @@ class DirectionView: UIView {
     func resetTracking() {
         // Reset tracking state when view appears
         currentAngle = 0
-        smoothedAngle = 0
-        angleHistory.removeAll()
+        targetAngle = 0
+        rawAngleHistory.removeAll()
         isFirstUpdate = true
         centerDot.alpha = 1.0  // Reset dot opacity
+        arrowImageView.transform = .identity  // Reset arrow rotation
+    }
+    
+    deinit {
+        // Clean up display link
+        stopDisplayLink()
     }
 }
