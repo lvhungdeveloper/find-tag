@@ -196,35 +196,52 @@ class DirectionView: UIView {
     // MARK: - Public Methods
     func updateDirection(direction: simd_float3, distance: Float?, deviceHeading: Float? = nil) {
         // ============================================================
-        // STEP 1: VALIDATE & NORMALIZE DIRECTION VECTOR (RAW DATA)
+        // STEP 1: VALIDATE DIRECTION VECTOR (3D - with elevation)
         // ============================================================
-        // Only use horizontal component (project to XZ plane)
-        let horizontalDirection = simd_float3(direction.x, 0, direction.z)
-        let magnitude = simd_length(horizontalDirection)
+        // Calculate FULL 3D magnitude (not just horizontal)
+        let magnitude = simd_length(direction)
         
-        // Tăng threshold để chỉ chấp nhận signals mạnh (0.05 → 0.12)
-        // Signal yếu thường không chính xác, gây lệch góc
-        guard magnitude > 0.12 else {
+        // Lower threshold but validate properly - signal quality check
+        // (0.12 → 0.08 để nhận nhiều signal hơn, nhưng có quality filtering)
+        guard magnitude > 0.08 else {
             // Direction vector too weak - keep current angle
             return
         }
         
-        // Normalize for consistent angle calculation
-        let normalized = simd_normalize(horizontalDirection)
+        // Normalize 3D direction for consistent calculation
+        let normalized = simd_normalize(direction)
         
-        // Đánh giá quality của signal dựa trên magnitude
-        let isHighQualitySignal = magnitude > 0.7  // Signal rất mạnh = rất tin cậy
+        // Signal quality based on magnitude
+        let isHighQualitySignal = magnitude > 0.5  // Giảm từ 0.7 → 0.5 để adaptive hơn
         
         // ============================================================
-        // STEP 2: CALCULATE RAW ANGLE (không lọc)
+        // STEP 2: EXTRACT AZIMUTH & ELEVATION (3D angles)
         // ============================================================
         // UWB coordinate: x=right, y=up, z=backward
-        // atan2(x, -z) gives angle relative to forward direction
+        
+        // AZIMUTH (góc ngang - horizontal angle): [-π, π]
         //   0° = forward, 90° = right, ±180° = backward, -90° = left
-        let rawAngle = atan2(normalized.x, -normalized.z)
+        let azimuth = atan2(normalized.x, -normalized.z)
+        
+        // ELEVATION (góc dọc - vertical angle): [-π/2, π/2]
+        // Sử dụng asin(y) hoặc atan2(y, horizontal_magnitude)
+        let horizontalMagnitude = sqrt(normalized.x * normalized.x + normalized.z * normalized.z)
+        let elevation = atan2(normalized.y, horizontalMagnitude)
         
         // ============================================================
-        // STEP 3: LƯU RAW ANGLE VÀO HISTORY
+        // STEP 3: ANDROID ALGORITHM - 3D → 2D PROJECTION
+        // ============================================================
+        // 🔥 ĐÂY LÀ CÔNG THỨC TỪ ANDROID (MainActivity.java line 270)
+        // double azimuth_h = Math.atan2(Math.sin(-azimuth*Math.PI/180), Math.sin(elevation*Math.PI/180));
+        //
+        // Giải thích: Chiếu vector 3D xuống mặt phẳng 2D navigation
+        // - sin(-azimuth): Thành phần X (đảo dấu azimuth)
+        // - sin(elevation): Thành phần Y
+        // - atan2(): Tính góc tổng hợp từ 2 thành phần
+        let rawAngle = atan2(sin(-azimuth), sin(elevation))
+        
+        // ============================================================
+        // STEP 4: LƯU RAW ANGLE VÀO HISTORY
         // ============================================================
         rawAngleHistory.append(rawAngle)
         if rawAngleHistory.count > historySize {
@@ -232,7 +249,7 @@ class DirectionView: UIView {
         }
         
         // ============================================================
-        // STEP 4: ÁP DỤNG WEIGHTED MOVING AVERAGE (trung bình trượt có trọng số)
+        // STEP 5: ÁP DỤNG WEIGHTED MOVING AVERAGE (trung bình trượt có trọng số)
         // ============================================================
         let wmaAngle: Float
         
@@ -255,7 +272,7 @@ class DirectionView: UIView {
         }
         
         // ============================================================
-        // STEP 5: ADAPTIVE SMOOTHING - Smoothing ít hơn khi signal tốt
+        // STEP 6: ADAPTIVE SMOOTHING - Smoothing ít hơn khi signal tốt
         // ============================================================
         if !isFirstUpdate {
             // Tính angular difference
@@ -271,7 +288,7 @@ class DirectionView: UIView {
         }
         
         // ============================================================
-        // STEP 6: UPDATE UI (CADisplayLink sẽ smooth interpolate đến targetAngle)
+        // STEP 7: UPDATE UI (CADisplayLink sẽ smooth interpolate đến targetAngle)
         // ============================================================
         let degrees = targetAngle * 180.0 / Float.pi
         
