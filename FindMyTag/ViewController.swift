@@ -441,12 +441,25 @@ extension ViewController: NISessionDelegate {
             if let direction = obj.direction {
                 logger.info("  Direction: x=\(String(format: "%.3f", direction.x)), y=\(String(format: "%.3f", direction.y)), z=\(String(format: "%.3f", direction.z)) ✅")
                 
-                // Calculate angle and magnitude for debugging
-                let angle = atan2(direction.x, -direction.z)
-                let degrees = angle * 180.0 / Float.pi
-                let horizontalMagnitude = sqrt(direction.x * direction.x + direction.z * direction.z)
+                // 🔥 ANDROID ALGORITHM DEBUG - Calculate azimuth, elevation, and projected angle
+                let normalized = simd_normalize(direction)
+                let magnitude = simd_length(direction)
                 
-                logger.info("  Calculated Angle: \(String(format: "%.1f", degrees))° | H-Mag: \(String(format: "%.3f", horizontalMagnitude))")
+                // AZIMUTH (horizontal angle)
+                let azimuth = atan2(normalized.x, -normalized.z)
+                let azimuthDegrees = azimuth * 180.0 / Float.pi
+                
+                // ELEVATION (vertical angle)
+                let horizontalMagnitude = sqrt(normalized.x * normalized.x + normalized.z * normalized.z)
+                let elevation = atan2(normalized.y, horizontalMagnitude)
+                let elevationDegrees = elevation * 180.0 / Float.pi
+                
+                // PROJECTED 2D ANGLE (Android formula)
+                let projectedAngle = atan2(sin(-azimuth), sin(elevation))
+                let projectedDegrees = projectedAngle * 180.0 / Float.pi
+                
+                logger.info("  📐 Azimuth: \(String(format: "%.1f", azimuthDegrees))° | Elevation: \(String(format: "%.1f", elevationDegrees))° | Projected: \(String(format: "%.1f", projectedDegrees))°")
+                logger.info("  📊 Magnitude: \(String(format: "%.3f", magnitude)) | H-Mag: \(String(format: "%.3f", horizontalMagnitude))")
             } else {
                 logger.info("  Direction: nil ❌")
             }
