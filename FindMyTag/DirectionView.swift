@@ -229,16 +229,15 @@ class DirectionView: UIView {
         let elevation = atan2(normalized.y, horizontalMagnitude)
         
         // ============================================================
-        // STEP 3: ANDROID ALGORITHM - 3D → 2D PROJECTION
+        // STEP 3: ANDROID ALGORITHM - 3D → 2D PROJECTION (FIXED)
         // ============================================================
-        // 🔥 ĐÂY LÀ CÔNG THỨC TỪ ANDROID (MainActivity.java line 270)
+        // 🔥 ĐÂY LÀ CÔNG THỨC TỪ ANDROID (MainActivity.java line 270) - ĐÃ SỬA
         // double azimuth_h = Math.atan2(Math.sin(-azimuth*Math.PI/180), Math.sin(elevation*Math.PI/180));
         //
-        // Giải thích: Chiếu vector 3D xuống mặt phẳng 2D navigation
-        // - sin(-azimuth): Thành phần X (đảo dấu azimuth)
-        // - sin(elevation): Thành phần Y
-        // - atan2(): Tính góc tổng hợp từ 2 thành phần
-        let rawAngle = atan2(sin(-azimuth), sin(elevation))
+        // ⚠️ FIX: Bỏ dấu trừ ở azimuth để mũi tên chỉ đúng chiều
+        // - Khi tag ở bên PHẢI → azimuth dương → sin(azimuth) dương → arrow chỉ PHẢI ✅
+        // - Khi tag ở bên TRÁI → azimuth âm → sin(azimuth) âm → arrow chỉ TRÁI ✅
+        let rawAngle = atan2(sin(azimuth), sin(elevation))
         
         // ============================================================
         // STEP 4: LƯU RAW ANGLE VÀO HISTORY
