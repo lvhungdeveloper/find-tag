@@ -1,5 +1,7 @@
 import UIKit
 import simd
+import CoreLocation
+import CoreMotion
 
 class DirectionView: UIView {
     
@@ -11,23 +13,43 @@ class DirectionView: UIView {
     private let nameLabel = UILabel()
     private let hintLabel = UILabel()
     
-    // Smoothing parameters
+    // Smoothing parameters - BALANCED for smooth + responsive
     private var currentAngle: Float = 0  // Góc hiện tại đang hiển thị (interpolated)
     private var targetAngle: Float = 0   // Góc mục tiêu (sau khi lọc)
     private var isFirstUpdate = true
     
-    // Moving average filter - lưu nhiều raw samples để tính trung bình
+    // Simple moving average filter - Balance giữa smooth và responsive
     private var rawAngleHistory: [Float] = []
-    private let historySize = 8  // Giảm từ 20 → 8 để responsive hơn
-    
-    // Weighted moving average weights - samples gần đây có trọng số NHIỀU hơn
-    private let weights: [Float] = [0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.22]  // Tổng = 1.0, bias mạnh về samples mới
+    private let historySize = 5  // Tăng lên 5 để ổn định hơn, giảm nhiễu
     
     // CADisplayLink for smooth 60fps animation
     private var displayLink: CADisplayLink?
     
-    // Exponential smoothing factor (double smoothing sau WMA)
-    private let exponentialSmoothingFactor: Float = 0.30  // Tăng từ 0.15 → 0.30 để responsive hơn
+    // Exponential smoothing factor - BALANCED
+    private let exponentialSmoothingFactor: Float = 0.45  // Balance giữa nhanh và smooth
+    
+    // MARK: - Sensor Fusion - Cache last valid direction
+    private var lastValidAngle: Float?            // Last valid calculated angle (after projection)
+    private var lastValidDeviceHeading: Float?    // Device heading when we got last valid direction
+    private var cacheTimestamp: Date?             // Khi nào cache được tạo
+    
+    // Counter for consecutive nil directions
+    private var consecutiveNilCount: Int = 0
+    private let nilThreshold: Int = 10  // Dùng cache sau 10 lần nil liên tiếp
+    
+    // Cache expiry rules - CRITICAL để tránh sai hướng khi user di chuyển
+    private let maxCacheAge: TimeInterval = 5.0   // Cache max 5 giây
+    private var stepCountAtCache: Int = 0         // Số bước chân khi cache
+    private let maxStepsBeforeInvalidate: Int = 3 // Invalidate nếu đi > 3 bước
+    
+    // Location manager for device heading (compass)
+    private let locationManager = CLLocationManager()
+    private var currentDeviceHeading: Float = 0  // Current device heading from compass (radians)
+    private var isHeadingReady = false  // Track if heading data is available
+    
+    // Pedometer to detect user movement (invalidate cache when walking)
+    private let pedometer = CMPedometer()
+    private var currentStepCount: Int = 0  // Tổng số bước từ khi bắt đầu
     
     // MARK: - Init
     override init(frame: CGRect) {
@@ -139,6 +161,46 @@ class DirectionView: UIView {
         
         // Start smooth animation loop
         startDisplayLink()
+        
+        // Start device heading tracking (compass) for sensor fusion
+        startHeadingTracking()
+        
+        // Start pedometer tracking to detect user movement
+        startPedometerTracking()
+    }
+    
+    // MARK: - Heading Tracking (Compass via CLLocationManager)
+    private func startHeadingTracking() {
+        locationManager.delegate = self
+        
+        // Check if heading is available
+        guard CLLocationManager.headingAvailable() else {
+            print("⚠️ Heading (compass) not available on this device")
+            return
+        }
+        
+        locationManager.headingFilter = 1  // Update every 1 degree change
+        locationManager.startUpdatingHeading()
+        print("🧭 Starting compass heading tracking...")
+    }
+    
+    // MARK: - Pedometer Tracking (Detect user movement)
+    private func startPedometerTracking() {
+        guard CMPedometer.isStepCountingAvailable() else {
+            print("⚠️ Pedometer not available on this device")
+            return
+        }
+        
+        // Start counting steps from now
+        pedometer.startUpdates(from: Date()) { [weak self] (data, error) in
+            guard let data = data, error == nil else { return }
+            
+            DispatchQueue.main.async {
+                self?.currentStepCount = data.numberOfSteps.intValue
+            }
+        }
+        
+        print("👟 Starting pedometer tracking...")
     }
     
     // MARK: - Display Link Animation (60fps)
@@ -157,8 +219,21 @@ class DirectionView: UIView {
         // Smooth interpolation từ currentAngle đến targetAngle
         let angleDiff = shortestAngularDifference(from: currentAngle, to: targetAngle)
         
-        // Exponential smoothing với damping - TĂNG để responsive hơn
-        let dampingFactor: Float = 0.18  // Tăng từ 0.08 → 0.18 để nhanh hơn
+        // Adaptive damping - nhanh khi góc lớn, chậm khi góc nhỏ (tránh giật)
+        let absDiff = abs(angleDiff)
+        let dampingFactor: Float
+        
+        if absDiff > 0.5 {
+            // Góc lớn (>28°) - xoay nhanh
+            dampingFactor = 0.30
+        } else if absDiff > 0.2 {
+            // Góc trung bình (11-28°) - xoay vừa
+            dampingFactor = 0.22
+        } else {
+            // Góc nhỏ (<11°) - xoay chậm để smooth, tránh giật
+            dampingFactor = 0.15
+        }
+        
         currentAngle = currentAngle + angleDiff * dampingFactor
         
         // Normalize angle
@@ -201,10 +276,10 @@ class DirectionView: UIView {
         // Calculate FULL 3D magnitude (not just horizontal)
         let magnitude = simd_length(direction)
         
-        // Lower threshold but validate properly - signal quality check
-        // (0.12 → 0.08 để nhận nhiều signal hơn, nhưng có quality filtering)
-        guard magnitude > 0.08 else {
-            // Direction vector too weak - keep current angle
+        // TĂNG threshold để lọc tín hiệu yếu/nhiễu (tránh góc nhảy lung tung)
+        guard magnitude > 0.15 else {
+            // Direction vector too weak - try to use cached direction
+            tryUseCachedDirection(distance: distance)
             return
         }
         
@@ -212,7 +287,9 @@ class DirectionView: UIView {
         let normalized = simd_normalize(direction)
         
         // Signal quality based on magnitude
-        let isHighQualitySignal = magnitude > 0.5  // Giảm từ 0.7 → 0.5 để adaptive hơn
+        // Tín hiệu tốt → ít smoothing, responsive
+        // Tín hiệu yếu → nhiều smoothing hơn, tránh nhiễu
+        let isHighQualitySignal = magnitude > 0.6
         
         // ============================================================
         // STEP 2: EXTRACT AZIMUTH & ELEVATION (3D angles)
@@ -228,16 +305,44 @@ class DirectionView: UIView {
         let horizontalMagnitude = sqrt(normalized.x * normalized.x + normalized.z * normalized.z)
         let elevation = atan2(normalized.y, horizontalMagnitude)
         
+        // Debug log azimuth & elevation & signal quality
+        let azimuthDeg = azimuth * 180.0 / Float.pi
+        let elevationDeg = elevation * 180.0 / Float.pi
+        let qualityEmoji = isHighQualitySignal ? "🟢" : "🟡"
+        print("🎯 \(qualityEmoji) Azimuth: \(String(format: "%+.1f°", azimuthDeg)) | Elevation: \(String(format: "%+.1f°", elevationDeg)) | Mag: \(String(format: "%.2f", magnitude))")
+        
         // ============================================================
-        // STEP 3: ANDROID ALGORITHM - 3D → 2D PROJECTION (FIXED)
+        // STEP 3: 2D NAVIGATION - Chỉ dùng AZIMUTH (góc ngang)
         // ============================================================
-        // 🔥 ĐÂY LÀ CÔNG THỨC TỪ ANDROID (MainActivity.java line 270) - ĐÃ SỬA
-        // double azimuth_h = Math.atan2(Math.sin(-azimuth*Math.PI/180), Math.sin(elevation*Math.PI/180));
+        // ⚠️ QUAN TRỌNG: Vì hiển thị 2D arrow (không phụ thuộc độ cao iPhone),
+        // ta CHỈ DÙNG AZIMUTH (góc ngang), BỎ QUA elevation để tránh sai khi iPhone nằm ngang
         //
-        // ⚠️ FIX: Bỏ dấu trừ ở azimuth để mũi tên chỉ đúng chiều
-        // - Khi tag ở bên PHẢI → azimuth dương → sin(azimuth) dương → arrow chỉ PHẢI ✅
-        // - Khi tag ở bên TRÁI → azimuth âm → sin(azimuth) âm → arrow chỉ TRÁI ✅
-        let rawAngle = atan2(sin(azimuth), sin(elevation))
+        // UWB Direction Vector Convention:
+        //   - direction.x > 0: Tag ở bên PHẢI
+        //   - direction.x < 0: Tag ở bên TRÁI
+        //   - direction.z < 0: Tag ở phía TRƯỚC
+        //   - direction.z > 0: Tag ở phía SAU
+        //
+        // Azimuth = atan2(x, -z):
+        //   - 0°: Tag ở phía TRƯỚC
+        //   - +90°: Tag ở bên PHẢI
+        //   - ±180°: Tag ở phía SAU
+        //   - -90°: Tag ở bên TRÁI
+        //
+        // ⚠️ CRITICAL: Arrow rotation angle in UIKit:
+        //   - 0 rad: Arrow points UP (default)
+        //   - Positive rotation: Clockwise (right)
+        //   - Negative rotation: Counter-clockwise (left)
+        //
+        // Để mũi tên chỉ đúng hướng về tag, dùng TRỰC TIẾP azimuth
+        var rawAngle = azimuth
+        
+        // DEAD ZONE: Nếu góc quá nhỏ (< 5°), coi như thẳng (0°)
+        // Tránh arrow rung khi tag gần như thẳng hàng
+        let deadZoneThreshold: Float = 5.0 * Float.pi / 180.0  // 5 degrees
+        if abs(rawAngle) < deadZoneThreshold {
+            rawAngle = 0  // Snap to center
+        }
         
         // ============================================================
         // STEP 4: LƯU RAW ANGLE VÀO HISTORY
@@ -248,43 +353,53 @@ class DirectionView: UIView {
         }
         
         // ============================================================
-        // STEP 5: ÁP DỤNG WEIGHTED MOVING AVERAGE (trung bình trượt có trọng số)
+        // STEP 5: SIMPLE MOVING AVERAGE - Đơn giản và nhanh
         // ============================================================
-        let wmaAngle: Float
+        let smoothedAngle: Float
         
         if isFirstUpdate {
             // First reading: khởi tạo
-            wmaAngle = rawAngle
+            smoothedAngle = rawAngle
             targetAngle = rawAngle
             currentAngle = rawAngle
             isFirstUpdate = false
         } else if rawAngleHistory.count < 2 {
-            // Chưa đủ samples, dùng raw angle (giảm từ 3 → 2 để responsive hơn)
-            wmaAngle = rawAngle
-        } else if isHighQualitySignal && rawAngleHistory.count < 4 {
-            // Signal tốt + ít samples → dùng simple average nhanh
-            wmaAngle = simpleMovingAverage(rawAngleHistory)
+            // Chưa đủ samples, dùng raw angle trực tiếp
+            smoothedAngle = rawAngle
         } else {
-            // Đủ samples, dùng weighted moving average
-            // Samples gần đây có trọng số cao hơn
-            wmaAngle = weightedMovingAverage(rawAngleHistory)
+            // Dùng simple moving average (SMA) - nhanh và đơn giản
+            smoothedAngle = simpleMovingAverage(rawAngleHistory)
         }
         
         // ============================================================
-        // STEP 6: ADAPTIVE SMOOTHING - Smoothing ít hơn khi signal tốt
+        // STEP 6: ADAPTIVE EXPONENTIAL SMOOTHING
         // ============================================================
         if !isFirstUpdate {
             // Tính angular difference
-            let diff = shortestAngularDifference(from: targetAngle, to: wmaAngle)
+            let diff = shortestAngularDifference(from: targetAngle, to: smoothedAngle)
             
             // Adaptive smoothing factor dựa trên signal quality
-            // Signal tốt → responsive hơn (factor cao)
-            // Signal yếu → smooth hơn (factor thấp)
-            let adaptiveFactor: Float = isHighQualitySignal ? 0.50 : exponentialSmoothingFactor
+            // Signal tốt → responsive (factor cao)
+            // Signal yếu → smooth hơn (factor thấp) để tránh nhiễu
+            let adaptiveFactor: Float = isHighQualitySignal ? 0.60 : 0.35
             
-            // Apply exponential moving average (layer thứ 2)
+            // Apply exponential smoothing
             targetAngle = normalizeAngle(targetAngle + diff * adaptiveFactor)
         }
+        
+        // ============================================================
+        // CACHE ANGLE + HEADING for Sensor Fusion (only if heading ready)
+        // ============================================================
+        if isHeadingReady {
+            lastValidAngle = targetAngle
+            lastValidDeviceHeading = currentDeviceHeading
+            cacheTimestamp = Date()
+            stepCountAtCache = currentStepCount
+            print("📍 Cached: angle=\(String(format: "%.1f°", targetAngle * 180 / Float.pi)), heading=\(String(format: "%.1f°", currentDeviceHeading * 180 / Float.pi)), steps=\(currentStepCount)")
+        }
+        
+        // Reset nil counter (vì đã nhận được valid direction)
+        consecutiveNilCount = 0
         
         // ============================================================
         // STEP 7: UPDATE UI (CADisplayLink sẽ smooth interpolate đến targetAngle)
@@ -321,6 +436,140 @@ class DirectionView: UIView {
     }
     
     // ============================================================
+    // HELPER: Check if cached direction is still valid
+    // ============================================================
+    private func isCacheValid() -> Bool {
+        // Check if cache exists
+        guard lastValidAngle != nil,
+              lastValidDeviceHeading != nil,
+              let timestamp = cacheTimestamp else {
+            return false
+        }
+        
+        // Check 1: Cache age (không quá 5 giây)
+        let cacheAge = Date().timeIntervalSince(timestamp)
+        guard cacheAge <= maxCacheAge else {
+            print("⏰ Cache expired: \(String(format: "%.1f", cacheAge))s > \(maxCacheAge)s")
+            invalidateCache()
+            return false
+        }
+        
+        // Check 2: User movement (không đi quá 3 bước)
+        let stepsSinceCache = currentStepCount - stepCountAtCache
+        guard stepsSinceCache <= maxStepsBeforeInvalidate else {
+            print("🚶 User moved too much: \(stepsSinceCache) steps > \(maxStepsBeforeInvalidate) steps")
+            invalidateCache()
+            return false
+        }
+        
+        return true
+    }
+    
+    private func invalidateCache() {
+        lastValidAngle = nil
+        lastValidDeviceHeading = nil
+        cacheTimestamp = nil
+        print("❌ Cache invalidated")
+    }
+    
+    // ============================================================
+    // SENSOR FUSION LIGHT: Subtle update based on heading (for 3-9 nil count)
+    // ============================================================
+    private func tryUseCachedDirectionLight(distance: Float?) {
+        // CRITICAL: Check if cache is still valid (time + movement)
+        guard isCacheValid(),
+              let cachedAngle = lastValidAngle,
+              let cachedHeading = lastValidDeviceHeading else {
+            // No cached data or cache invalid
+            updateDistanceOnly(distance: distance)
+            showNoDirection()
+            return
+        }
+        
+        // Calculate adjusted angle based on heading change
+        let headingChange = currentDeviceHeading - cachedHeading
+        let adjustedAngle = normalizeAngle(cachedAngle - headingChange)
+        
+        // Update target angle with LOW smoothing factor (subtle update)
+        let diff = shortestAngularDifference(from: targetAngle, to: adjustedAngle)
+        targetAngle = normalizeAngle(targetAngle + diff * 0.25)  // Factor thấp để subtle
+        
+        // Update distance
+        if let distance = distance {
+            let displayDistance = max(distance, 0.0)
+            distanceLabel.text = String(format: "%.1f m", displayDistance)
+        } else {
+            distanceLabel.text = "-- m"
+        }
+        
+        // Giữ arrow sáng 100%
+        arrowImageView.alpha = 1.0
+    }
+    
+    // ============================================================
+    // SENSOR FUSION FULL: Use cached direction when UWB signal is lost
+    // ============================================================
+    private func tryUseCachedDirection(distance: Float?) {
+        // CRITICAL: Check if cache is still valid (time + movement)
+        guard isCacheValid(),
+              let cachedAngle = lastValidAngle,
+              let cachedHeading = lastValidDeviceHeading else {
+            // No cached data or cache invalid - show "no direction"
+            updateDistanceOnly(distance: distance)
+            showNoDirection()
+            return
+        }
+        
+        // ============================================================
+        // CALCULATE ADJUSTED ANGLE using Sensor Fusion
+        // ============================================================
+        // Công thức: Tag ở absolute direction trong world space
+        //   Tag absolute = cachedAngle + cachedHeading
+        //   Current relative = Tag absolute - Current heading
+        //                    = cachedAngle + (cachedHeading - currentHeading)
+        //
+        // Ví dụ: Tag ở phía trước (0°) khi heading=0°
+        //        Quay lưng 180° → heading=180°
+        //        → Relative = 0° + (0° - 180°) = -180° (tag ở phía sau) ✅
+        
+        let headingChange = currentDeviceHeading - cachedHeading
+        let adjustedAngle = normalizeAngle(cachedAngle - headingChange)
+        
+        print("🔄 Sensor Fusion: cached=\(String(format: "%.1f°", cachedAngle * 180 / Float.pi)), headingΔ=\(String(format: "%.1f°", headingChange * 180 / Float.pi)), adjusted=\(String(format: "%.1f°", adjustedAngle * 180 / Float.pi))")
+        
+        // Update target angle with HIGH smoothing factor để smooth như real-time
+        // Vì compass update liên tục 60Hz, nên dùng factor cao để responsive
+        let diff = shortestAngularDifference(from: targetAngle, to: adjustedAngle)
+        targetAngle = normalizeAngle(targetAngle + diff * 0.70)  // Tăng lên 0.70 để smooth và responsive
+        
+        // Update UI with estimated direction + visual cue
+        let degrees = adjustedAngle * 180.0 / Float.pi
+        let directionText = getDirectionText(degrees: degrees)
+        
+        // Visual cue: Thêm hint cho user biết đang dùng estimated direction
+        if let timestamp = cacheTimestamp {
+            let cacheAge = Date().timeIntervalSince(timestamp)
+            hintLabel.text = "\(directionText) • move to refresh"  // Hint: di chuyển để refresh
+        } else {
+            hintLabel.text = directionText
+        }
+        
+        // Update distance
+        if let distance = distance {
+            let displayDistance = max(distance, 0.0)
+            distanceLabel.text = String(format: "%.1f m", displayDistance)
+        } else {
+            distanceLabel.text = "-- m"
+        }
+        
+        // Không làm mờ arrow - giữ nguyên opacity (vì đã có cached data)
+        UIView.animate(withDuration: 0.3) {
+            self.arrowImageView.alpha = 1.0  // Giữ nguyên độ sáng
+            self.hintLabel.textColor = .white
+        }
+    }
+    
+    // ============================================================
     // HELPER: Simple Moving Average (SMA)
     // ============================================================
     private func simpleMovingAverage(_ angles: [Float]) -> Float {
@@ -348,42 +597,6 @@ class DirectionView: UIView {
         return result
     }
     
-    // ============================================================
-    // HELPER: Weighted Moving Average (WMA)
-    // ============================================================
-    private func weightedMovingAverage(_ angles: [Float]) -> Float {
-        guard !angles.isEmpty else { return 0 }
-        
-        // Lấy N samples gần nhất (N = số lượng weights)
-        let n = min(weights.count, angles.count)
-        let recentAngles = Array(angles.suffix(n))
-        let recentWeights = Array(weights.suffix(n))
-        
-        // Normalize weights nếu không dùng hết
-        let weightSum = recentWeights.reduce(0, +)
-        let normalizedWeights = recentWeights.map { $0 / weightSum }
-        
-        // Xử lý angle wrap-around
-        let reference = recentAngles[0]
-        var weightedSum: Float = 0
-        
-        for (angle, weight) in zip(recentAngles, normalizedWeights) {
-            var diff = angle - reference
-            // Normalize difference to [-π, π]
-            while diff > Float.pi { diff -= 2 * Float.pi }
-            while diff < -Float.pi { diff += 2 * Float.pi }
-            weightedSum += diff * weight
-        }
-        
-        var result = reference + weightedSum
-        
-        // Normalize result to [-π, π]
-        while result > Float.pi { result -= 2 * Float.pi }
-        while result < -Float.pi { result += 2 * Float.pi }
-        
-        return result
-    }
-    
     func updateDistanceOnly(distance: Float?) {
         // Update distance without touching arrow rotation (show 0.0m if negative)
         if let distance = distance {
@@ -391,6 +604,33 @@ class DirectionView: UIView {
             distanceLabel.text = String(format: "%.1f m", displayDistance)
         } else {
             distanceLabel.text = "-- m"
+        }
+    }
+    
+    // MARK: - Update with optional direction (handles sensor fusion)
+    func updateWithOptionalDirection(direction: simd_float3?, distance: Float?) {
+        if let direction = direction {
+            // Valid UWB direction - use it
+            updateDirection(direction: direction, distance: distance, deviceHeading: nil)
+            showHasDirection()
+        } else {
+            // No UWB direction - increment nil counter
+            consecutiveNilCount += 1
+            
+            // Chỉ dùng sensor fusion SAU KHI mất tín hiệu 10 lần liên tiếp
+            if consecutiveNilCount >= nilThreshold {
+                // Đã mất tín hiệu đủ lâu → dùng cached direction FULL
+                tryUseCachedDirection(distance: distance)
+            } else if consecutiveNilCount >= 3 {
+                // Mất 3-9 lần → bắt đầu dùng sensor fusion NHẸ (đánh lừa user)
+                // Update arrow theo heading để smooth, nhưng với factor thấp hơn
+                tryUseCachedDirectionLight(distance: distance)
+                print("⏳ Nil count: \(consecutiveNilCount)/\(nilThreshold) - Using light sensor fusion...")
+            } else {
+                // Mới mất 1-2 lần → chỉ update distance, giữ nguyên arrow
+                updateDistanceOnly(distance: distance)
+                print("⏳ Nil count: \(consecutiveNilCount)/\(nilThreshold) - Waiting...")
+            }
         }
     }
     
@@ -451,10 +691,39 @@ class DirectionView: UIView {
         isFirstUpdate = true
         centerDot.alpha = 1.0  // Reset dot opacity
         arrowImageView.transform = .identity  // Reset arrow rotation
+        arrowImageView.alpha = 1.0  // Reset arrow opacity
+        
+        // Reset cached direction (sensor fusion)
+        invalidateCache()
+        consecutiveNilCount = 0
+        currentStepCount = 0
+        stepCountAtCache = 0
+        print("🔄 Tracking reset")
     }
     
     deinit {
-        // Clean up display link
+        // Clean up display link, location manager, and pedometer
         stopDisplayLink()
+        locationManager.stopUpdatingHeading()
+        pedometer.stopUpdates()
+    }
+}
+
+// MARK: - CLLocationManagerDelegate
+extension DirectionView: CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        // Convert compass heading (0-360°, clockwise from North) to radians
+        // Note: 0° = North, 90° = East, 180° = South, 270° = West
+        let headingDegrees = Float(newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading)
+        currentDeviceHeading = headingDegrees * Float.pi / 180.0  // Convert to radians
+        
+        if !isHeadingReady {
+            isHeadingReady = true
+            print("✅ Compass heading ready, initial: \(String(format: "%.1f°", headingDegrees))")
+        }
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("⚠️ Location manager error: \(error.localizedDescription)")
     }
 }

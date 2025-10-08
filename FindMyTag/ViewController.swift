@@ -466,15 +466,8 @@ extension ViewController: NISessionDelegate {
             
             // Update direction view if it's visible
             if !directionView.isHidden {
-                if let direction = obj.direction {
-                    // UWB direction is RELATIVE to device - no heading adjustment needed
-                    directionView.updateDirection(direction: direction, distance: obj.distance, deviceHeading: nil)
-                    directionView.showHasDirection()
-                } else {
-                    // Direction is nil - update distance but keep arrow dim
-                    directionView.updateDistanceOnly(distance: obj.distance)
-                    directionView.showNoDirection()
-                }
+                // Use sensor fusion - will automatically use cached direction if current is nil
+                directionView.updateWithOptionalDirection(direction: obj.direction, distance: obj.distance)
             }
         }
     }
