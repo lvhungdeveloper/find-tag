@@ -476,7 +476,7 @@ extension ViewController: NISessionDelegate {
             
             // Update direction view if it's visible
             if !directionView.isHidden {
-                // 3-tier fallback: direction → horizontalAngle → sensor fusion
+                // 2-tier fallback: direction → horizontalAngle (Camera Assistance)
                 directionView.updateWithOptionalDirection(
                     direction: obj.direction,
                     horizontalAngle: obj.horizontalAngle,
