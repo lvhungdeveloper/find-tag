@@ -265,6 +265,15 @@ class ViewController: UIViewController {
                 
                 niSession = NISession()
                 niSession.delegate = self
+                
+                // ✅ ENABLE CAMERA ASSISTANCE for horizontalAngle
+                if #available(iOS 16.0, *) {
+                    configuration!.isCameraAssistanceEnabled = true
+                    logger.info("📸 Camera Assistance ENABLED for horizontalAngle")
+                } else {
+                    logger.info("⚠️ Camera Assistance requires iOS 16+")
+                }
+                
                 niSession.run(configuration!)
                 
                 isSessionRunning = true
@@ -438,36 +447,41 @@ extension ViewController: NISessionDelegate {
                 logger.info("  Distance: nil ❌")
             }
             
+            // Log direction vector
             if let direction = obj.direction {
                 logger.info("  Direction: x=\(String(format: "%.3f", direction.x)), y=\(String(format: "%.3f", direction.y)), z=\(String(format: "%.3f", direction.z)) ✅")
                 
-                // 🔥 ANDROID ALGORITHM DEBUG - Calculate azimuth, elevation, and projected angle
                 let normalized = simd_normalize(direction)
                 let magnitude = simd_length(direction)
                 
-                // AZIMUTH (horizontal angle)
                 let azimuth = atan2(normalized.x, -normalized.z)
                 let azimuthDegrees = azimuth * 180.0 / Float.pi
                 
-                // ELEVATION (vertical angle)
                 let horizontalMagnitude = sqrt(normalized.x * normalized.x + normalized.z * normalized.z)
                 let elevation = atan2(normalized.y, horizontalMagnitude)
                 let elevationDegrees = elevation * 180.0 / Float.pi
                 
-                // PROJECTED 2D ANGLE (Android formula)
-                let projectedAngle = atan2(sin(-azimuth), sin(elevation))
-                let projectedDegrees = projectedAngle * 180.0 / Float.pi
-                
-                logger.info("  📐 Azimuth: \(String(format: "%.1f", azimuthDegrees))° | Elevation: \(String(format: "%.1f", elevationDegrees))° | Projected: \(String(format: "%.1f", projectedDegrees))°")
-                logger.info("  📊 Magnitude: \(String(format: "%.3f", magnitude)) | H-Mag: \(String(format: "%.3f", horizontalMagnitude))")
+                logger.info("  📐 Azimuth: \(String(format: "%.1f", azimuthDegrees))° | Elevation: \(String(format: "%.1f", elevationDegrees))° | Mag: \(String(format: "%.3f", magnitude))")
             } else {
                 logger.info("  Direction: nil ❌")
             }
             
+            // ⚠️ CRITICAL TEST: Check if horizontalAngle is EVER populated
+            if let horizontalAngle = obj.horizontalAngle {
+                let horizontalAngleDegrees = horizontalAngle * 180.0 / Float.pi
+                logger.info("  🟢 HorizontalAngle: \(String(format: "%+.1f°", horizontalAngleDegrees)) ✅✅✅ FOUND!")
+            } else {
+                logger.info("  🔴 HorizontalAngle: nil (always null)")
+            }
+            
             // Update direction view if it's visible
             if !directionView.isHidden {
-                // Use sensor fusion - will automatically use cached direction if current is nil
-                directionView.updateWithOptionalDirection(direction: obj.direction, distance: obj.distance)
+                // 3-tier fallback: direction → horizontalAngle → sensor fusion
+                directionView.updateWithOptionalDirection(
+                    direction: obj.direction,
+                    horizontalAngle: obj.horizontalAngle,
+                    distance: obj.distance
+                )
             }
         }
     }

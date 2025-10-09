@@ -1,7 +1,6 @@
 import UIKit
 import simd
 import CoreLocation
-import CoreMotion
 
 class DirectionView: UIView {
     
@@ -29,27 +28,17 @@ class DirectionView: UIView {
     private let exponentialSmoothingFactor: Float = 0.45  // Balance giữa nhanh và smooth
     
     // MARK: - Sensor Fusion - Cache last valid direction
-    private var lastValidAngle: Float?            // Last valid calculated angle (after projection)
+    private var lastValidAngle: Float?            // Last valid azimuth (relative to device)
     private var lastValidDeviceHeading: Float?    // Device heading when we got last valid direction
-    private var cacheTimestamp: Date?             // Khi nào cache được tạo
     
     // Counter for consecutive nil directions
     private var consecutiveNilCount: Int = 0
-    private let nilThreshold: Int = 10  // Dùng cache sau 10 lần nil liên tiếp
-    
-    // Cache expiry rules - CRITICAL để tránh sai hướng khi user di chuyển
-    private let maxCacheAge: TimeInterval = 5.0   // Cache max 5 giây
-    private var stepCountAtCache: Int = 0         // Số bước chân khi cache
-    private let maxStepsBeforeInvalidate: Int = 3 // Invalidate nếu đi > 3 bước
+    private let nilThreshold: Int = 3  // Dùng sensor fusion sau 3 lần nil liên tiếp
     
     // Location manager for device heading (compass)
     private let locationManager = CLLocationManager()
     private var currentDeviceHeading: Float = 0  // Current device heading from compass (radians)
     private var isHeadingReady = false  // Track if heading data is available
-    
-    // Pedometer to detect user movement (invalidate cache when walking)
-    private let pedometer = CMPedometer()
-    private var currentStepCount: Int = 0  // Tổng số bước từ khi bắt đầu
     
     // MARK: - Init
     override init(frame: CGRect) {
@@ -164,9 +153,6 @@ class DirectionView: UIView {
         
         // Start device heading tracking (compass) for sensor fusion
         startHeadingTracking()
-        
-        // Start pedometer tracking to detect user movement
-        startPedometerTracking()
     }
     
     // MARK: - Heading Tracking (Compass via CLLocationManager)
@@ -182,25 +168,6 @@ class DirectionView: UIView {
         locationManager.headingFilter = 1  // Update every 1 degree change
         locationManager.startUpdatingHeading()
         print("🧭 Starting compass heading tracking...")
-    }
-    
-    // MARK: - Pedometer Tracking (Detect user movement)
-    private func startPedometerTracking() {
-        guard CMPedometer.isStepCountingAvailable() else {
-            print("⚠️ Pedometer not available on this device")
-            return
-        }
-        
-        // Start counting steps from now
-        pedometer.startUpdates(from: Date()) { [weak self] (data, error) in
-            guard let data = data, error == nil else { return }
-            
-            DispatchQueue.main.async {
-                self?.currentStepCount = data.numberOfSteps.intValue
-            }
-        }
-        
-        print("👟 Starting pedometer tracking...")
     }
     
     // MARK: - Display Link Animation (60fps)
@@ -387,19 +354,7 @@ class DirectionView: UIView {
             targetAngle = normalizeAngle(targetAngle + diff * adaptiveFactor)
         }
         
-        // ============================================================
-        // CACHE ANGLE + HEADING for Sensor Fusion (only if heading ready)
-        // ============================================================
-        if isHeadingReady {
-            lastValidAngle = targetAngle
-            lastValidDeviceHeading = currentDeviceHeading
-            cacheTimestamp = Date()
-            stepCountAtCache = currentStepCount
-            print("📍 Cached: angle=\(String(format: "%.1f°", targetAngle * 180 / Float.pi)), heading=\(String(format: "%.1f°", currentDeviceHeading * 180 / Float.pi)), steps=\(currentStepCount)")
-        }
-        
-        // Reset nil counter (vì đã nhận được valid direction)
-        consecutiveNilCount = 0
+        // No caching - sensor fusion disabled
         
         // ============================================================
         // STEP 7: UPDATE UI (CADisplayLink sẽ smooth interpolate đến targetAngle)
@@ -436,85 +391,28 @@ class DirectionView: UIView {
     }
     
     // ============================================================
-    // HELPER: Check if cached direction is still valid
+    // HELPER: Check if cached direction exists
     // ============================================================
     private func isCacheValid() -> Bool {
-        // Check if cache exists
-        guard lastValidAngle != nil,
-              lastValidDeviceHeading != nil,
-              let timestamp = cacheTimestamp else {
-            return false
-        }
-        
-        // Check 1: Cache age (không quá 5 giây)
-        let cacheAge = Date().timeIntervalSince(timestamp)
-        guard cacheAge <= maxCacheAge else {
-            print("⏰ Cache expired: \(String(format: "%.1f", cacheAge))s > \(maxCacheAge)s")
-            invalidateCache()
-            return false
-        }
-        
-        // Check 2: User movement (không đi quá 3 bước)
-        let stepsSinceCache = currentStepCount - stepCountAtCache
-        guard stepsSinceCache <= maxStepsBeforeInvalidate else {
-            print("🚶 User moved too much: \(stepsSinceCache) steps > \(maxStepsBeforeInvalidate) steps")
-            invalidateCache()
-            return false
-        }
-        
-        return true
+        // Cache is valid if we have both angle and heading
+        // NO expiry - cache lasts until we get new UWB signal!
+        return lastValidAngle != nil && lastValidDeviceHeading != nil
     }
     
     private func invalidateCache() {
         lastValidAngle = nil
         lastValidDeviceHeading = nil
-        cacheTimestamp = nil
         print("❌ Cache invalidated")
     }
     
     // ============================================================
-    // SENSOR FUSION LIGHT: Subtle update based on heading (for 3-9 nil count)
-    // ============================================================
-    private func tryUseCachedDirectionLight(distance: Float?) {
-        // CRITICAL: Check if cache is still valid (time + movement)
-        guard isCacheValid(),
-              let cachedAngle = lastValidAngle,
-              let cachedHeading = lastValidDeviceHeading else {
-            // No cached data or cache invalid
-            updateDistanceOnly(distance: distance)
-            showNoDirection()
-            return
-        }
-        
-        // Calculate adjusted angle based on heading change
-        let headingChange = currentDeviceHeading - cachedHeading
-        let adjustedAngle = normalizeAngle(cachedAngle - headingChange)
-        
-        // Update target angle with LOW smoothing factor (subtle update)
-        let diff = shortestAngularDifference(from: targetAngle, to: adjustedAngle)
-        targetAngle = normalizeAngle(targetAngle + diff * 0.25)  // Factor thấp để subtle
-        
-        // Update distance
-        if let distance = distance {
-            let displayDistance = max(distance, 0.0)
-            distanceLabel.text = String(format: "%.1f m", displayDistance)
-        } else {
-            distanceLabel.text = "-- m"
-        }
-        
-        // Giữ arrow sáng 100%
-        arrowImageView.alpha = 1.0
-    }
-    
-    // ============================================================
-    // SENSOR FUSION FULL: Use cached direction when UWB signal is lost
+    // SENSOR FUSION: Use cached direction when UWB signal is lost
     // ============================================================
     private func tryUseCachedDirection(distance: Float?) {
-        // CRITICAL: Check if cache is still valid (time + movement)
         guard isCacheValid(),
               let cachedAngle = lastValidAngle,
               let cachedHeading = lastValidDeviceHeading else {
-            // No cached data or cache invalid - show "no direction"
+            // No cached data - show "no direction"
             updateDistanceOnly(distance: distance)
             showNoDirection()
             return
@@ -537,22 +435,14 @@ class DirectionView: UIView {
         
         print("🔄 Sensor Fusion: cached=\(String(format: "%.1f°", cachedAngle * 180 / Float.pi)), headingΔ=\(String(format: "%.1f°", headingChange * 180 / Float.pi)), adjusted=\(String(format: "%.1f°", adjustedAngle * 180 / Float.pi))")
         
-        // Update target angle with HIGH smoothing factor để smooth như real-time
-        // Vì compass update liên tục 60Hz, nên dùng factor cao để responsive
+        // Update target angle smoothly
         let diff = shortestAngularDifference(from: targetAngle, to: adjustedAngle)
-        targetAngle = normalizeAngle(targetAngle + diff * 0.70)  // Tăng lên 0.70 để smooth và responsive
+        targetAngle = normalizeAngle(targetAngle + diff * 0.70)
         
-        // Update UI with estimated direction + visual cue
+        // Update UI
         let degrees = adjustedAngle * 180.0 / Float.pi
         let directionText = getDirectionText(degrees: degrees)
-        
-        // Visual cue: Thêm hint cho user biết đang dùng estimated direction
-        if let timestamp = cacheTimestamp {
-            let cacheAge = Date().timeIntervalSince(timestamp)
-            hintLabel.text = "\(directionText) • move to refresh"  // Hint: di chuyển để refresh
-        } else {
-            hintLabel.text = directionText
-        }
+        hintLabel.text = directionText
         
         // Update distance
         if let distance = distance {
@@ -562,9 +452,9 @@ class DirectionView: UIView {
             distanceLabel.text = "-- m"
         }
         
-        // Không làm mờ arrow - giữ nguyên opacity (vì đã có cached data)
+        // Keep arrow visible
         UIView.animate(withDuration: 0.3) {
-            self.arrowImageView.alpha = 1.0  // Giữ nguyên độ sáng
+            self.arrowImageView.alpha = 1.0
             self.hintLabel.textColor = .white
         }
     }
@@ -607,31 +497,88 @@ class DirectionView: UIView {
         }
     }
     
-    // MARK: - Update with optional direction (handles sensor fusion)
-    func updateWithOptionalDirection(direction: simd_float3?, distance: Float?) {
+    // MARK: - Update with optional direction/horizontalAngle (SIMPLIFIED - NO SENSOR FUSION)
+    func updateWithOptionalDirection(direction: simd_float3?, horizontalAngle: Float?, distance: Float?) {
         if let direction = direction {
-            // Valid UWB direction - use it
-            updateDirection(direction: direction, distance: distance, deviceHeading: nil)
+            // Has direction vector - use it
+            updateDirection(direction: direction, distance: distance)
             showHasDirection()
+            print("✅ Using direction vector")
+        } else if let horizontalAngle = horizontalAngle {
+            // No direction, but has horizontalAngle - use it
+            updateDirectionFromHorizontalAngle(horizontalAngle: horizontalAngle, distance: distance)
+            showHasDirection()
+            print("🟢 Using horizontalAngle (RARE!)")
         } else {
-            // No UWB direction - increment nil counter
-            consecutiveNilCount += 1
-            
-            // Chỉ dùng sensor fusion SAU KHI mất tín hiệu 10 lần liên tiếp
-            if consecutiveNilCount >= nilThreshold {
-                // Đã mất tín hiệu đủ lâu → dùng cached direction FULL
-                tryUseCachedDirection(distance: distance)
-            } else if consecutiveNilCount >= 3 {
-                // Mất 3-9 lần → bắt đầu dùng sensor fusion NHẸ (đánh lừa user)
-                // Update arrow theo heading để smooth, nhưng với factor thấp hơn
-                tryUseCachedDirectionLight(distance: distance)
-                print("⏳ Nil count: \(consecutiveNilCount)/\(nilThreshold) - Using light sensor fusion...")
-            } else {
-                // Mới mất 1-2 lần → chỉ update distance, giữ nguyên arrow
-                updateDistanceOnly(distance: distance)
-                print("⏳ Nil count: \(consecutiveNilCount)/\(nilThreshold) - Waiting...")
-            }
+            // No data at all - show "no direction"
+            updateDistanceOnly(distance: distance)
+            showNoDirection()
+            print("🔴 No direction data - arrow faded")
         }
+    }
+    
+    // MARK: - Update using horizontalAngle only (TIER 2)
+    private func updateDirectionFromHorizontalAngle(horizontalAngle: Float, distance: Float?) {
+        var rawAngle = horizontalAngle
+        
+        print("🎯 Horizontal Angle: \(String(format: "%+.1f°", rawAngle * 180 / Float.pi))")
+        
+        // Dead zone
+        let deadZoneThreshold: Float = 5.0 * Float.pi / 180.0
+        if abs(rawAngle) < deadZoneThreshold {
+            rawAngle = 0
+        }
+        
+        // Moving average
+        rawAngleHistory.append(rawAngle)
+        if rawAngleHistory.count > historySize {
+            rawAngleHistory.removeFirst()
+        }
+        
+        let smoothedAngle: Float
+        
+        if isFirstUpdate {
+            smoothedAngle = rawAngle
+            targetAngle = rawAngle
+            currentAngle = rawAngle
+            isFirstUpdate = false
+        } else if rawAngleHistory.count < 2 {
+            smoothedAngle = rawAngle
+        } else {
+            smoothedAngle = simpleMovingAverage(rawAngleHistory)
+        }
+        
+        // Exponential smoothing
+        if !isFirstUpdate {
+            let diff = shortestAngularDifference(from: targetAngle, to: smoothedAngle)
+            targetAngle = normalizeAngle(targetAngle + diff * 0.50)
+        }
+        
+        // No caching - sensor fusion disabled
+        
+        // Update UI
+        let degrees = targetAngle * 180.0 / Float.pi
+        let isAligned = abs(targetAngle) < 0.17
+        
+        if isAligned && abs(targetAngle - currentAngle) > 0.15 {
+            let generator = UIImpactFeedbackGenerator(style: .medium)
+            generator.impactOccurred()
+        }
+        
+        UIView.animate(withDuration: 0.2) {
+            self.centerDot.alpha = isAligned ? 0.3 : 1.0
+        }
+        
+        if let distance = distance {
+            let displayDistance = max(distance, 0.0)
+            distanceLabel.text = String(format: "%.1f m", displayDistance)
+        } else {
+            distanceLabel.text = "-- m"
+        }
+        
+        let directionText = getDirectionText(degrees: degrees)
+        hintLabel.text = directionText
+        hintLabel.textColor = .white
     }
     
     private func getDirectionText(degrees: Float) -> String {
@@ -689,23 +636,16 @@ class DirectionView: UIView {
         targetAngle = 0
         rawAngleHistory.removeAll()
         isFirstUpdate = true
-        centerDot.alpha = 1.0  // Reset dot opacity
-        arrowImageView.transform = .identity  // Reset arrow rotation
-        arrowImageView.alpha = 1.0  // Reset arrow opacity
-        
-        // Reset cached direction (sensor fusion)
-        invalidateCache()
-        consecutiveNilCount = 0
-        currentStepCount = 0
-        stepCountAtCache = 0
+        centerDot.alpha = 1.0
+        arrowImageView.transform = .identity
+        arrowImageView.alpha = 1.0
         print("🔄 Tracking reset")
     }
     
     deinit {
-        // Clean up display link, location manager, and pedometer
+        // Clean up display link and location manager
         stopDisplayLink()
         locationManager.stopUpdatingHeading()
-        pedometer.stopUpdates()
     }
 }
 
